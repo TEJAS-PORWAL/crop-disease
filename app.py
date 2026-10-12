@@ -4,9 +4,13 @@ Run with:  streamlit run app.py
 """
 from __future__ import annotations
 
+import io
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 import config
 from src.treatments import get_treatment, is_healthy
@@ -20,6 +24,12 @@ st.set_page_config(
 
 # Confidence below this is flagged as uncertain.
 UNCERTAIN_THRESHOLD = 0.50
+# If the gap between the top-1 and top-2 probabilities is below this, the
+# prediction is ambiguous (two classes look almost equally likely) and is
+# treated as uncertain even when the top confidence clears the threshold.
+MARGIN_THRESHOLD = 0.15
+# Reject uploads larger than this to avoid memory issues from huge images.
+MAX_UPLOAD_MB = 10
 
 # --- Styling -----------------------------------------------------------------
 CUSTOM_CSS = """
@@ -160,15 +170,80 @@ def _load_model_and_classes():
     return model, class_names
 
 
+@st.cache_data(show_spinner=False)
+def _find_example_images() -> dict[str, str]:
+    """Find one example image per class from the validation set.
+
+    Returns a mapping of pretty class name -> absolute image path. Cached so the
+    filesystem scan runs only once. Returns an empty dict if no data is present.
+    """
+    examples: dict[str, str] = {}
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    for base in (config.VAL_DIR, config.TRAIN_DIR):
+        if not base.exists():
+            continue
+        for class_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+            pretty = _pretty(class_dir.name)
+            if pretty in examples:
+                continue
+            for img in sorted(class_dir.iterdir()):
+                if img.suffix.lower() in exts:
+                    examples[pretty] = str(img)
+                    break
+    return examples
+
+
 def _preprocess(pil_image: Image.Image) -> np.ndarray:
     img = pil_image.convert("RGB").resize(config.IMG_SIZE)
     arr = np.asarray(img, dtype=np.float32)  # [0, 255]
     return np.expand_dims(arr, axis=0)
 
 
+def _model_view(pil_image: Image.Image) -> Image.Image:
+    """Return exactly what the model sees: an RGB image resized to IMG_SIZE."""
+    return pil_image.convert("RGB").resize(config.IMG_SIZE)
+
+
 def _pretty(label: str) -> str:
     """Turn 'Tomato___Early_blight' into 'Tomato · Early blight'."""
     return label.replace("___", " · ").replace("_", " ")
+
+
+def _load_image_safely(source) -> Image.Image | None:
+    """Open an image defensively, surfacing a friendly error on failure.
+
+    `source` may be a Streamlit UploadedFile or a filesystem path. Returns the
+    loaded PIL image, or None if the file is too large, corrupt, or unreadable
+    (in which case an error has already been shown to the user).
+    """
+    # Size guard for uploads (UploadedFile exposes .size and .name).
+    size = getattr(source, "size", None)
+    if size is not None and size > MAX_UPLOAD_MB * 1024 * 1024:
+        st.error(
+            f"That image is {size / (1024 * 1024):.1f} MB, which is larger than "
+            f"the {MAX_UPLOAD_MB} MB limit. Please upload a smaller photo."
+        )
+        return None
+
+    try:
+        # Read raw bytes so we can both verify integrity and then reload.
+        if hasattr(source, "read"):
+            raw = source.read()
+        else:
+            raw = Path(source).read_bytes()
+
+        # verify() detects truncated/corrupt files but consumes the image,
+        # so we reopen from the same bytes afterward for actual use.
+        Image.open(io.BytesIO(raw)).verify()
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        return image
+    except (UnidentifiedImageError, OSError, ValueError):
+        st.error(
+            "That file could not be read as an image. It may be corrupt or in an "
+            "unsupported format. Please try a different photo."
+        )
+        return None
 
 
 def _render_hero() -> None:
@@ -202,9 +277,21 @@ def _render_sidebar(class_names: list[str]) -> None:
             st.markdown(f"<span class='muted'>• {_pretty(name)}</span>", unsafe_allow_html=True)
 
 
-def _render_result_banner(top_label: str, top_conf: float) -> None:
-    """Color-coded banner: healthy / disease / uncertain."""
+def _classify_status(top_conf: float, margin: float) -> tuple[bool, str]:
+    """Decide the result status from confidence and the top-1/top-2 margin.
+
+    Returns (uncertain, reason). `reason` is empty when the result is confident.
+    """
     if top_conf < UNCERTAIN_THRESHOLD:
+        return True, "low confidence"
+    if margin < MARGIN_THRESHOLD:
+        return True, "two classes look almost equally likely"
+    return False, ""
+
+
+def _render_result_banner(top_label: str, top_conf: float, uncertain: bool) -> None:
+    """Color-coded banner: healthy / disease / uncertain."""
+    if uncertain:
         banner_cls, label_txt = "banner-uncertain", "Uncertain — please verify"
     elif is_healthy(top_label):
         banner_cls, label_txt = "banner-healthy", "Looks healthy 🌿"
@@ -224,7 +311,7 @@ def _render_result_banner(top_label: str, top_conf: float) -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
-def _render_treatment(top_label: str, uncertain: bool) -> None:
+def _render_treatment(top_label: str, uncertain: bool, reason: str) -> None:
     t = get_treatment(top_label)
     steps_html = "".join(
         f'<div class="treat-step"><span class="dot">✓</span><span>{step}</span></div>'
@@ -233,8 +320,8 @@ def _render_treatment(top_label: str, uncertain: bool) -> None:
     note = ""
     if uncertain:
         note = (
-            '<div class="uncertain-note">⚠️ Low confidence — treat this as a '
-            "suggestion and verify with another photo or an expert.</div>"
+            f'<div class="uncertain-note">⚠️ Uncertain result ({reason}) — treat '
+            "this as a suggestion and verify with another photo or an expert.</div>"
         )
     html = (
         '<div class="card">'
@@ -249,8 +336,7 @@ def _render_treatment(top_label: str, uncertain: bool) -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
-def _render_probabilities(class_names: list[str], probs: np.ndarray) -> None:
-    ranked = sorted(zip(class_names, probs), key=lambda x: x[1], reverse=True)[:5]
+def _render_probabilities(ranked: list[tuple[str, float]]) -> None:
     rows = "".join(
         f'<div class="rank-row"><span class="rank-name">{_pretty(n)}</span>'
         f'<span class="rank-bar"><span class="rank-bar-fill" style="width:{p*100:.1f}%"></span></span>'
@@ -264,6 +350,79 @@ def _render_probabilities(class_names: list[str], probs: np.ndarray) -> None:
         "</div>"
     )
     st.markdown(html, unsafe_allow_html=True)
+
+
+def _build_report(
+    top_label: str,
+    top_conf: float,
+    uncertain: bool,
+    reason: str,
+    ranked: list[tuple[str, float]],
+    source_name: str,
+) -> str:
+    """Build a plain-text diagnosis report for download."""
+    t = get_treatment(top_label)
+    status = "UNCERTAIN" if uncertain else ("HEALTHY" if is_healthy(top_label) else "DISEASE DETECTED")
+    lines = [
+        "CROP DISEASE DETECTION — DIAGNOSIS REPORT",
+        "=" * 44,
+        f"Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Image     : {source_name}",
+        "",
+        f"Status    : {status}",
+        f"Diagnosis : {_pretty(top_label)}",
+        f"Confidence: {top_conf * 100:.1f}%",
+    ]
+    if uncertain:
+        lines.append(f"Note      : Result flagged uncertain ({reason}). Please verify.")
+    lines += ["", "TOP MATCHES", "-" * 44]
+    lines += [f"  {_pretty(n):<42} {p * 100:6.2f}%" for n, p in ranked]
+    lines += [
+        "",
+        "RECOMMENDED TREATMENT",
+        "-" * 44,
+        f"Summary: {t['summary']}",
+        f"Cause  : {t['cause']}",
+        "Steps  :",
+    ]
+    lines += [f"  - {step}" for step in t["steps"]]
+    lines += [
+        "",
+        "=" * 44,
+        "General guidance for educational use. Always follow product labels and",
+        "local regulations, and consult your agricultural extension service for a",
+        "confirmed diagnosis.",
+    ]
+    return "\n".join(lines)
+
+
+def _analyze_and_render(image: Image.Image, model, class_names: list[str], source_name: str) -> None:
+    """Run inference on a loaded image and render the full result panel."""
+    with st.spinner("Analyzing..."):
+        batch = _preprocess(image)
+        probs = model.predict(batch, verbose=0)[0]
+
+    order = np.argsort(probs)[::-1]
+    ranked = [(class_names[i], float(probs[i])) for i in order[:5]]
+    top_label = class_names[int(order[0])]
+    top_conf = float(probs[int(order[0])])
+    second_conf = float(probs[int(order[1])]) if len(order) > 1 else 0.0
+    margin = top_conf - second_conf
+
+    uncertain, reason = _classify_status(top_conf, margin)
+
+    _render_result_banner(top_label, top_conf, uncertain)
+    _render_treatment(top_label, uncertain, reason)
+    _render_probabilities(ranked)
+
+    report = _build_report(top_label, top_conf, uncertain, reason, ranked, source_name)
+    st.download_button(
+        "⬇️ Download diagnosis report",
+        data=report,
+        file_name=f"diagnosis_{top_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        mime="text/plain",
+        width="stretch",
+    )
 
 
 def main() -> None:
@@ -282,6 +441,9 @@ def main() -> None:
 
     _render_sidebar(class_names)
 
+    # Session state tracks which image to analyze and where it came from.
+    st.session_state.setdefault("example_path", None)
+
     left, right = st.columns([1, 1], gap="large")
 
     with left:
@@ -291,35 +453,56 @@ def main() -> None:
             type=["png", "jpg", "jpeg", "bmp", "webp"],
             label_visibility="collapsed",
         )
+
+        # --- Example gallery -------------------------------------------------
+        examples = _find_example_images()
+        if examples:
+            with st.expander("🌿 Or try an example image"):
+                st.caption("Pick a sample leaf to run the model without uploading.")
+                choice = st.selectbox(
+                    "Example class",
+                    options=["—"] + list(examples.keys()),
+                    label_visibility="collapsed",
+                )
+                if choice != "—":
+                    if st.button("Use this example", width="stretch"):
+                        st.session_state["example_path"] = examples[choice]
+
+        # Decide the active image source: a fresh upload wins over an example.
+        image = None
+        source_name = ""
         if uploaded is not None:
-            image = Image.open(uploaded)
-            st.image(image, caption="Uploaded image", width="stretch")
+            st.session_state["example_path"] = None  # upload overrides example
+            image = _load_image_safely(uploaded)
+            source_name = uploaded.name
+        elif st.session_state["example_path"]:
+            path = st.session_state["example_path"]
+            image = _load_image_safely(path)
+            source_name = Path(path).name
+
+        if image is not None:
+            st.image(image, caption=f"Input: {source_name}", width="stretch")
+            # Show exactly what the model sees (RGB, resized to IMG_SIZE).
+            with st.expander("🔍 What the model sees"):
+                st.image(
+                    _model_view(image),
+                    caption=f"Preprocessed to {config.IMG_WIDTH}×{config.IMG_HEIGHT} RGB",
+                    width=config.IMG_WIDTH,
+                )
 
     with right:
-        if uploaded is None:
+        if image is None:
             empty_html = (
                 '<div class="card empty-state">'
                 '<div class="empty-icon">🍃</div>'
                 '<div class="empty-title">Awaiting an image</div>'
-                '<div class="muted">Upload a crop leaf photo to see the '
-                "diagnosis and treatment here.</div>"
+                '<div class="muted">Upload a crop leaf photo (or try an example) '
+                "to see the diagnosis and treatment here.</div>"
                 "</div>"
             )
             st.markdown(empty_html, unsafe_allow_html=True)
-            return
-
-        with st.spinner("Analyzing..."):
-            batch = _preprocess(image)
-            probs = model.predict(batch, verbose=0)[0]
-
-        top_idx = int(np.argmax(probs))
-        top_label = class_names[top_idx]
-        top_conf = float(probs[top_idx])
-        uncertain = top_conf < UNCERTAIN_THRESHOLD
-
-        _render_result_banner(top_label, top_conf)
-        _render_treatment(top_label, uncertain)
-        _render_probabilities(class_names, probs)
+        else:
+            _analyze_and_render(image, model, class_names, source_name)
 
     st.caption(
         "General guidance for educational use. Always follow product labels and "
